@@ -19,6 +19,7 @@
 package main
 
 import (
+	"sync"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -26,10 +27,10 @@ import (
 	"go/token"
 	"io"
 	"log"
+	"regexp"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 const usageDoc = `Calculate cyclomatic complexities of Go functions.
@@ -41,7 +42,8 @@ Flags:
                   return exit code 1 if the set is non-empty
         -top N    show the top N most complex functions only
         -avg      show the average complexity over all functions,
-                  not depending on whether -over or -top are set
+				  not depending on whether -over or -top are set
+        -ignore   ignore via regex
 
 The output fields for each line are:
 <complexity> <package> <function> <file:row:column>
@@ -56,6 +58,7 @@ var (
 	over = flag.Int("over", 0, "show functions with complexity > N only")
 	top  = flag.Int("top", -1, "show the top N most complex functions only")
 	avg  = flag.Bool("avg", false, "show the average complexity")
+	ignore  = flag.String("ignore", "", "ignore via regex")
 )
 
 func main() {
@@ -68,7 +71,17 @@ func main() {
 		usage()
 	}
 
-	stats := analyze(args)
+	reg, err := regexp.Compile(*ignore)
+	if err != nil {
+		log.Fatalln("failed to compile regex")
+	}
+	
+	if *ignore == "" {
+		reg = nil
+	}
+
+	stats := analyze(args, reg)
+
 	sort.Sort(byComplexity(stats))
 	written := writeStats(os.Stdout, stats)
 
@@ -81,16 +94,51 @@ func main() {
 	}
 }
 
-func analyze(paths []string) []stat {
-	var stats []stat
+
+
+func analyze(paths []string, reg *regexp.Regexp) []stat {
+	out := make(chan stat)
+	done := make(chan struct{})
+
+	var list []stat
+	wg := &sync.WaitGroup{}
+
 	for _, path := range paths {
+		_, name := filepath.Split(path)
+		if reg != nil && reg.MatchString(name) {
+			continue
+		}
+
 		if isDir(path) {
-			stats = analyzeDir(path, stats)
+			analyzeDir(path, out, wg, reg)
 		} else {
-			stats = analyzeFile(path, stats)
+			wg.Add(1)
+			go analyzeFile(path, out, wg)
 		}
 	}
-	return stats
+
+	go func(){
+
+	for {
+		select {
+		case o := <-out:
+			list = append(list, o)
+			break
+		case <-done:
+			return 
+		default:
+			break
+		}
+	}
+
+	}()
+
+	wg.Wait()
+	done <- struct{}{}
+	close(out)
+	close(done)
+
+	return list
 }
 
 func isDir(filename string) bool {
@@ -98,23 +146,29 @@ func isDir(filename string) bool {
 	return err == nil && fi.IsDir()
 }
 
-func analyzeFile(fname string, stats []stat) []stat {
+func analyzeFile(fname string, stats chan<- stat, wg *sync.WaitGroup)  {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, fname, nil, 0)
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	return buildStats(f, fset, stats)
+	
+	buildStats(f, fset, stats)
+	wg.Done()
 }
 
-func analyzeDir(dirname string, stats []stat) []stat {
-	filepath.Walk(dirname, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && strings.HasSuffix(path, ".go") {
-			stats = analyzeFile(path, stats)
+func analyzeDir(dirname string, stats chan<- stat, wg *sync.WaitGroup, reg *regexp.Regexp) {
+	files, _ := filepath.Glob(filepath.Join(dirname, "*.go"))
+		for _, file := range files {
+			_, name := filepath.Split(file)
+			if reg != nil && reg.MatchString(name) {
+				continue
+			}
+
+			wg.Add(1)
+			go analyzeFile(file, stats, wg)
 		}
-		return err
-	})
-	return stats
 }
 
 func writeStats(w io.Writer, sortedStats []stat) int {
@@ -161,18 +215,17 @@ func (s byComplexity) Less(i, j int) bool {
 	return s[i].Complexity >= s[j].Complexity
 }
 
-func buildStats(f *ast.File, fset *token.FileSet, stats []stat) []stat {
+func buildStats(f *ast.File, fset *token.FileSet, stats chan<- stat) {
 	for _, decl := range f.Decls {
 		if fn, ok := decl.(*ast.FuncDecl); ok {
-			stats = append(stats, stat{
+			stats <- stat{
 				PkgName:    f.Name.Name,
 				FuncName:   funcName(fn),
 				Complexity: complexity(fn),
 				Pos:        fset.Position(fn.Pos()),
-			})
+			}
 		}
 	}
-	return stats
 }
 
 // funcName returns the name representation of a function or method:
